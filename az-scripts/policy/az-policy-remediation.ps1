@@ -54,6 +54,10 @@
     Optional cap on how many remediation targets are processed in this run.
     Use this to test with a single remediation before scaling out. Default: 0.
 
+.PARAMETER ParallelLaunchThrottle
+    Maximum number of concurrent remediation launch operations in Phase 3.
+    Higher values reduce total launch time but increase API load. Default: 10.
+
 .PARAMETER RunFilePath
     Optional path to a run file (JSON) produced by StartOnly/StartAndWait.
     - In ReportOnly mode: required unless you want to use the newest run file in script folder.
@@ -111,6 +115,10 @@ param (
     [Parameter()]
     [ValidateRange(0, 1000)]
     [int]$MaxRemediations = 0,
+
+    [Parameter()]
+    [ValidateRange(1, 50)]
+    [int]$ParallelLaunchThrottle = 10,
 
     [Parameter()]
     [string]$RunFilePath
@@ -192,18 +200,34 @@ function New-RemediationName {
     $safeName = ($assignmentName -replace '[^a-zA-Z0-9]', '-').ToLower()
 
     if ($PolicyDefinitionReferenceId) {
-        $safeRef = ($PolicyDefinitionReferenceId -replace '[^a-zA-Z0-9]', '-').ToLower()
-        $name = "rem-${safeName}-${safeRef}-${timestamp}"
+        # Use first 8 chars of SHA256 hash to ensure uniqueness while staying within length limits
+        $refHash = ([System.BitConverter]::ToString(
+                [System.Security.Cryptography.SHA256]::Create().ComputeHash(
+                    [System.Text.Encoding]::UTF8.GetBytes($PolicyDefinitionReferenceId)
+                )
+            ) -replace '-', '').Substring(0, 8).ToLower()
+        $name = "rem-${safeName}-${refHash}-${timestamp}"
     }
     else {
         $name = "rem-${safeName}-${timestamp}"
     }
 
-    # Trim to 64 chars while keeping the timestamp suffix for uniqueness
+    # Trim to 64 chars if needed (should rarely happen with hash approach)
     if ($name.Length -gt 64) {
-        $overhead = 4 + 1 + $timestamp.Length   # "rem-" + "-" + timestamp
+        $overhead = 4 + 1 + 8 + 1 + $timestamp.Length   # "rem-" + "-" + hash(8) + "-" + timestamp
         $allowedLen = 64 - $overhead
-        $name = "rem-$($safeName.Substring(0, [Math]::Min($safeName.Length, $allowedLen)))-$timestamp"
+        $trimmedSafeName = $safeName.Substring(0, [Math]::Min($safeName.Length, $allowedLen))
+        if ($PolicyDefinitionReferenceId) {
+            $refHash = ([System.BitConverter]::ToString(
+                    [System.Security.Cryptography.SHA256]::Create().ComputeHash(
+                        [System.Text.Encoding]::UTF8.GetBytes($PolicyDefinitionReferenceId)
+                    )
+                ) -replace '-', '').Substring(0, 8).ToLower()
+            $name = "rem-${trimmedSafeName}-${refHash}-${timestamp}"
+        }
+        else {
+            $name = "rem-${trimmedSafeName}-${timestamp}"
+        }
     }
     return $name
 }
@@ -903,6 +927,9 @@ if ($MaxRemediations -gt 0) {
 $startedRemediations = [System.Collections.Generic.List[PSCustomObject]]::new()
 $resolvedRunPath = Resolve-RunFilePath -InputPath $RunFilePath -ExecutionMode $Mode
 
+# Build remediation job list
+$remediationJobs = [System.Collections.Generic.List[PSCustomObject]]::new()
+
 foreach ($target in $remediationTargets) {
 
     $scope = Resolve-AssignmentScope -PolicyAssignmentId $target.PolicyAssignmentId
@@ -942,8 +969,9 @@ foreach ($target in $remediationTargets) {
         }
     }
 
+    $refIdPart = if ($target.PolicyDefinitionReferenceId) { " | Ref: $($target.PolicyDefinitionReferenceId)" } else { '' }
     $logLine = "$($target.PolicyAssignmentName) | Effect: $($target.PolicyDefinitionAction) | " +
-    "Non-compliant: $($target.NonCompliantCount) | Scope: $scopeDesc"
+    "Non-compliant: $($target.NonCompliantCount) | Scope: $scopeDesc$refIdPart"
 
     # Build the record that will be tracked through phases 4 & 5
     $record = [PSCustomObject]@{
@@ -968,33 +996,118 @@ foreach ($target in $remediationTargets) {
         DeploymentFailureReasons    = @()
     }
 
-    if ($PSCmdlet.ShouldProcess($logLine, 'Start-AzPolicyRemediation')) {
+    $remediationJobs.Add([PSCustomObject]@{
+            Record     = $record
+            RemParams  = $remParams
+            LogLine    = $logLine
+            RemName    = $remName
+            ShouldProc = $PSCmdlet.ShouldProcess($logLine, 'Start-AzPolicyRemediation')
+        })
+}
+
+# Launch remediations in parallel batches
+if ($remediationJobs.Count -gt 0) {
+    Write-Log "Launching $($remediationJobs.Count) remediation(s) with throttle limit of $ParallelLaunchThrottle..."
+    
+    # Capture current Azure context to pass to runspaces
+    $azContext = Get-AzContext
+    if (-not $azContext) {
+        Write-Log "No Azure context found. Please run Connect-AzAccount first." -Level ERROR
+        exit 1
+    }
+    
+    # Create initial session state with required modules
+    $iss = [System.Management.Automation.Runspaces.InitialSessionState]::CreateDefault()
+    $iss.ImportPSModule(@('Az.PolicyInsights', 'Az.Accounts'))
+    
+    $runspacePool = [runspacefactory]::CreateRunspacePool(1, $ParallelLaunchThrottle, $iss, $Host)
+    $runspacePool.Open()
+    $runspaces = [System.Collections.Generic.List[PSCustomObject]]::new()
+
+    foreach ($job in $remediationJobs) {
+        if (-not $job.ShouldProc) {
+            # -WhatIf path
+            $job.Record.Status = 'WhatIf'
+            $startedRemediations.Add($job.Record)
+            Write-Log "  [WhatIf] Would start: $($job.LogLine)" -Level WARN
+            continue
+        }
+
+        Write-Log "  Queueing: $($job.LogLine)"
+        
+        $ps = [powershell]::Create()
+        $ps.RunspacePool = $runspacePool
+        
+        [void]$ps.AddScript({
+                param($RemParams, $RemName, $AzContext)
+                try {
+                    $ProgressPreference = 'SilentlyContinue'
+                    # Set the Azure context in this runspace
+                    $null = Set-AzContext -Context $AzContext -ErrorAction Stop
+                    $remediation = Start-AzPolicyRemediation @RemParams
+                    return @{
+                        Success           = $true
+                        ProvisioningState = $remediation.ProvisioningState
+                        RemName           = $RemName
+                    }
+                }
+                catch {
+                    return @{
+                        Success      = $false
+                        ErrorMessage = $_.Exception.Message
+                        RemName      = $RemName
+                    }
+                }
+            }).AddArgument($job.RemParams).AddArgument($job.RemName).AddArgument($azContext)
+
+        $handle = $ps.BeginInvoke()
+        
+        $runspaces.Add([PSCustomObject]@{
+                PowerShell = $ps
+                Handle     = $handle
+                Record     = $job.Record
+                RemName    = $job.RemName
+            })
+    }
+
+    # Wait for all runspaces to complete
+    Write-Log "Waiting for $($runspaces.Count) remediation launch(es) to complete..."
+    
+    foreach ($rs in $runspaces) {
+        $rs.Record.StartTime = Get-Date
+        
         try {
-            Write-Log "  Starting: $logLine"
-            $remediation = Invoke-WithProgressSuppressed {
-                Start-AzPolicyRemediation @remParams
+            $result = $rs.PowerShell.EndInvoke($rs.Handle)
+            
+            if ($result.Success) {
+                $rs.Record.ProvisioningState = $result.ProvisioningState
+                $rs.Record.Status = 'Started'
+                Write-Log "  ✓ Started '$($rs.RemName)' (initial state: $($result.ProvisioningState))" -Level SUCCESS
             }
-            $record.ProvisioningState = $remediation.ProvisioningState
-            $record.Status = 'Started'
-            $record.StartTime = Get-Date
-            Write-Log "  ✓ Started '$remName' (initial state: $($remediation.ProvisioningState))" -Level SUCCESS
+            else {
+                $rs.Record.ProvisioningState = 'LaunchFailed'
+                $rs.Record.Status = 'LaunchFailed'
+                $rs.Record.EndTime = Get-Date
+                $rs.Record.ErrorDetail = $result.ErrorMessage
+                Write-Log "  ✗ Failed to start '$($rs.RemName)': $($result.ErrorMessage)" -Level ERROR
+            }
         }
         catch {
-            $record.ProvisioningState = 'LaunchFailed'
-            $record.Status = 'LaunchFailed'
-            $record.StartTime = Get-Date
-            $record.EndTime = Get-Date
-            $record.ErrorDetail = $_.Exception.Message
-            Write-Log "  ✗ Failed to start remediation for '$($target.PolicyAssignmentName)': $($_.Exception.Message)" -Level ERROR
+            $rs.Record.ProvisioningState = 'LaunchFailed'
+            $rs.Record.Status = 'LaunchFailed'
+            $rs.Record.EndTime = Get-Date
+            $rs.Record.ErrorDetail = $_.Exception.Message
+            Write-Log "  ✗ Exception starting '$($rs.RemName)': $($_.Exception.Message)" -Level ERROR
         }
-        $startedRemediations.Add($record)
+        finally {
+            $rs.PowerShell.Dispose()
+        }
+        
+        $startedRemediations.Add($rs.Record)
     }
-    else {
-        # -WhatIf path
-        $record.Status = 'WhatIf'
-        $startedRemediations.Add($record)
-        Write-Log "  [WhatIf] Would start: $logLine" -Level WARN
-    }
+
+    $runspacePool.Close()
+    $runspacePool.Dispose()
 }
 
 # If running with -WhatIf nothing actually started; show preview and exit cleanly
